@@ -2,12 +2,17 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
+import re
+import sqlite3
 import sys
 import time
 import urllib.parse
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -30,6 +35,11 @@ _SCOPES = ["codewhisperer:completions", "codewhisperer:analysis", "codewhisperer
 _GRANTS = ["urn:ietf:params:oauth:grant-type:device_code", "refresh_token"]
 _TERMINAL_REFRESH_CODES = {"invalid_client", "invalid_grant", "invalid_token", "unauthorized_client"}
 BUILDER_ID_START_URL = "https://view.awsapps.com/start"
+# Sentinel passed where a start URL goes when the user picks "Google / GitHub (kiro-cli)".
+SOCIAL_LOGIN = "kiro-cli://social"
+_SOCIAL_TOKEN_KEY = "kirocli:social:token"
+_SOCIAL_REFRESH_URL = "https://prod.{region}.auth.desktop.kiro.dev/refreshToken"
+_SOCIAL_USER_AGENT = "KiroIDE-0.6.18-" + hashlib.sha256(b"hermes-kiro-provider").hexdigest()
 _PROFILE_ARNS: dict[str, str] = {}
 
 
@@ -52,14 +62,20 @@ class Credentials:
     client_secret_expires_at: float = 0.0
     profile_arn: str = ""
     credential_id: str = ""
+    auth_method: str = "idc"  # "idc" (AWS OIDC, incl. Builder ID) or "social" (Google/GitHub via kiro-cli)
+    social_provider: str = ""
 
     @property
     def api_region(self) -> str:
         return runtime_region(self.region)
 
     @property
+    def is_social(self) -> bool:
+        return self.auth_method == "social"
+
+    @property
     def is_builder_id(self) -> bool:
-        return self.start_url.rstrip("/") == BUILDER_ID_START_URL.rstrip("/")
+        return not self.is_social and self.start_url.rstrip("/") == BUILDER_ID_START_URL.rstrip("/")
 
 
 def hermes_home() -> Path:
@@ -125,8 +141,89 @@ def _post(region: str, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         raise KiroAuthError(f"AWS OIDC {path} is unreachable: {exc}") from exc
 
 
+def _kiro_cli_db_path() -> Path:
+    """Where kiro-cli keeps its sign-in; ``KIRO_CLI_DB`` overrides for tests and odd installs."""
+    if override := os.environ.get("KIRO_CLI_DB", "").strip():
+        return Path(override).expanduser()
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "kiro-cli" / "data.sqlite3"
+    base = os.environ.get("XDG_DATA_HOME", "").strip()
+    return (Path(base).expanduser() if base else Path.home() / ".local" / "share") / "kiro-cli" / "data.sqlite3"
+
+
+def _parse_expiry(value: Any) -> float:
+    """Parse kiro-cli's RFC 3339 ``expires_at`` (nanosecond digits); 0 means "refresh now"."""
+    try:
+        text = re.sub(r"(\.\d{6})\d+", r"\1", str(value).strip()).replace("Z", "+00:00")
+        return datetime.fromisoformat(text).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def read_kiro_cli_social(db_path: Path | None = None) -> Credentials:
+    """Read the Google/GitHub sign-in that ``kiro-cli login`` stored. Read-only; never logs token values."""
+    path = db_path or _kiro_cli_db_path()
+    if not path.is_file():
+        raise KiroAuthError(f"kiro-cli sign-in not found at {path}; run `kiro-cli login` first.")
+    try:
+        con = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=5)
+        try:
+            row = con.execute("SELECT value FROM auth_kv WHERE key = ?", (_SOCIAL_TOKEN_KEY,)).fetchone()
+        finally:
+            con.close()
+        data = json.loads(row[0]) if row else None
+    except (sqlite3.Error, ValueError, TypeError) as exc:
+        raise KiroAuthError(f"Could not read kiro-cli's sign-in ({type(exc).__name__}).") from None
+    if not isinstance(data, dict):
+        raise KiroAuthError("kiro-cli has no Google/GitHub sign-in; run `kiro-cli login` and choose a social provider.")
+    access, refresh = str(data.get("access_token") or ""), str(data.get("refresh_token") or "")
+    arn = str(data.get("profile_arn") or "").strip()
+    parts = arn.split(":")
+    if not refresh or len(parts) < 4 or parts[0] != "arn" or not parts[3]:
+        raise KiroAuthError("kiro-cli's sign-in is incomplete (no refresh token or profile ARN); run `kiro-cli login` again.")
+    return Credentials(
+        access_token=access, refresh_token=refresh, client_id="", client_secret="",
+        region=runtime_region(parts[3]), start_url="", expires_at=_parse_expiry(data.get("expires_at")),
+        profile_arn=arn, auth_method="social", social_provider=str(data.get("provider") or "").strip().lower(),
+    )
+
+
+def _refresh_social_tokens(region: str, refresh_token: str) -> dict[str, Any]:
+    """Exchange a Google/GitHub refresh token at Kiro's desktop auth service."""
+    try:
+        return request_json(
+            "POST",
+            _SOCIAL_REFRESH_URL.format(region=runtime_region(region)),
+            body=json.dumps({"refreshToken": refresh_token}).encode(),
+            headers={"Content-Type": "application/json", "Accept": "application/json", "User-Agent": _SOCIAL_USER_AGENT},
+        )
+    except KiroHTTPError as exc:
+        # 400/401/403 mean the refresh token itself is dead; 429/5xx are transient.
+        code = "invalid_grant" if exc.status in {400, 401, 403} else _error_code(exc.body)
+        raise KiroAuthError(
+            f"Kiro social token refresh failed ({exc.status}): {exc.body.decode('utf-8', 'replace')[:300]}",
+            code=code, status=exc.status,
+        ) from exc
+    except Exception as exc:
+        if isinstance(exc, KiroAuthError):
+            raise
+        raise KiroAuthError(f"Kiro social token refresh is unreachable: {exc}") from exc
+
+
 def _entry_credentials(entry: PooledCredential) -> Credentials:
     extra = entry.extra or {}
+    if extra.get("auth_method") == "social":
+        missing = [key for key in ("region", "profile_arn") if not str(extra.get(key) or "").strip()]
+        if missing:
+            raise KiroAuthError(
+                f"Kiro credential metadata is incomplete ({', '.join(missing)}); run `hermes auth add kiro` again."
+            )
+        return Credentials(
+            access_token=entry.access_token, refresh_token=entry.refresh_token or "", client_id="", client_secret="",
+            region=str(extra["region"]), start_url="", expires_at=float(entry.expires_at_ms or 0) / 1000.0,
+            profile_arn=str(extra["profile_arn"]), credential_id=entry.id,
+            auth_method="social", social_provider=str(extra.get("social_provider") or ""),
+        )
     required = ("client_id", "client_secret", "region", "start_url")
     missing = [key for key in required if not str(extra.get(key) or "").strip()]
     if missing:
@@ -153,6 +250,19 @@ def _entry_credentials(entry: PooledCredential) -> Credentials:
 def _pool_entry(creds: Credentials, *, label: str, source: str = SOURCE) -> PooledCredential:
     from agent.credential_pool import AUTH_TYPE_OAUTH, PooledCredential
 
+    if creds.is_social:
+        extra: dict[str, Any] = {
+            "auth_method": "social", "social_provider": creds.social_provider,
+            "region": creds.region, "profile_arn": creds.profile_arn,
+        }
+    else:
+        extra = {
+            "client_id": creds.client_id,
+            "client_secret": creds.client_secret,
+            "region": creds.region,
+            "start_url": creds.start_url,
+            "client_secret_expires_at": creds.client_secret_expires_at,
+        }
     return PooledCredential(
         provider=PROVIDER,
         id=uuid.uuid4().hex[:6],
@@ -164,13 +274,7 @@ def _pool_entry(creds: Credentials, *, label: str, source: str = SOURCE) -> Pool
         access_token=creds.access_token,
         refresh_token=creds.refresh_token,
         expires_at_ms=int(creds.expires_at * 1000),
-        extra={
-            "client_id": creds.client_id,
-            "client_secret": creds.client_secret,
-            "region": creds.region,
-            "start_url": creds.start_url,
-            "client_secret_expires_at": creds.client_secret_expires_at,
-        },
+        extra=extra,
     )
 
 
@@ -247,10 +351,53 @@ def login(
     label: str | None = None,
     priority: int | None = None,
 ) -> tuple[str, str]:
-    """Run device authorization and save the resulting grant in Hermes' pool."""
+    """Run device authorization and save the resulting grant in Hermes' pool.
+
+    ``start_url=SOCIAL_LOGIN`` instead imports the Google/GitHub sign-in from kiro-cli.
+    """
+    if start_url == SOCIAL_LOGIN:
+        creds = _import_social_login()
+        persist_credentials(creds, label=label or f"kiro-{creds.social_provider or 'social'}", priority=priority)
+        return "kiro-cli", creds.social_provider
     creds, uri, user_code = _device_login(start_url, region)
     persist_credentials(creds, label=label, priority=priority)
     return uri, user_code
+
+
+def _import_social_login() -> Credentials:
+    """Read kiro-cli's social sign-in and prove it works with one refresh before saving it."""
+    creds = read_kiro_cli_social()
+    token = _refresh_social_tokens(creds.region, creds.refresh_token)
+    access = token.get("accessToken")
+    if not access:
+        raise KiroAuthError("Kiro social token refresh returned no access token")
+    creds.access_token = str(access)
+    creds.refresh_token = str(token.get("refreshToken") or creds.refresh_token)
+    creds.expires_at = time.time() + float(token.get("expiresIn") or 3600)
+    return creds
+
+
+def _refresh_social(creds: Credentials) -> dict[str, Any]:
+    from hermes_cli.auth_constants import AuthError
+
+    try:
+        token = _refresh_social_tokens(creds.region, creds.refresh_token)
+    except KiroAuthError as exc:
+        if exc.code in _TERMINAL_REFRESH_CODES:
+            raise AuthError(
+                f"{exc} Sign in again with `kiro-cli login`, then `hermes auth add kiro`.",
+                provider=PROVIDER, code=exc.code, relogin_required=True,
+            ) from exc
+        raise
+    access = token.get("accessToken")
+    if not access:
+        raise KiroAuthError("Kiro token refresh returned no access token")
+    return {
+        "access_token": str(access),
+        # Kiro has not rotated this token in testing; accept a new one if that ever changes.
+        "refresh_token": str(token.get("refreshToken") or creds.refresh_token),
+        "expires_at_ms": int((time.time() + float(token.get("expiresIn") or 3600)) * 1000),
+    }
 
 
 def refresh_credential(entry: PooledCredential) -> dict[str, Any]:
@@ -258,6 +405,8 @@ def refresh_credential(entry: PooledCredential) -> dict[str, Any]:
     from hermes_cli.auth_constants import AuthError
 
     creds = _entry_credentials(entry)
+    if creds.is_social:
+        return _refresh_social(creds)
     if creds.client_secret_expires_at and time.time() >= creds.client_secret_expires_at:
         raise AuthError(
             "Kiro client registration expired; sign in again.",
@@ -331,7 +480,7 @@ def _next_login_choice(selected: int, key: str) -> int:
     if key == "up":
         return max(0, selected - 1)
     if key == "down":
-        return min(1, selected + 1)
+        return min(2, selected + 1)
     return selected
 
 
@@ -349,7 +498,7 @@ def _arrow_login_choice() -> str | None:
     previous = termios.tcgetattr(fd)
 
     def draw() -> None:
-        options = ("AWS Builder ID", "IAM Identity Center")
+        options = ("AWS Builder ID", "IAM Identity Center", "Google / GitHub (use kiro-cli login)")
         sys.stdout.write("\x1b[2J\x1b[H\nKiro login\n\nSelect login method:\n\n")
         for index, option in enumerate(options):
             sys.stdout.write(f"  {'❯' if index == selected else ' '} {option}\n")
@@ -370,7 +519,7 @@ def _arrow_login_choice() -> str | None:
                 key = sys.stdin.read(1)
                 selected = _next_login_choice(selected, "up" if key == "A" else "down" if key == "B" else "")
                 draw()
-            elif key in {"1", "2"}:
+            elif key in {"1", "2", "3"}:
                 selected = int(key) - 1
                 draw()
     finally:
@@ -382,9 +531,15 @@ def _arrow_login_choice() -> str | None:
 def prompt_login_inputs(start_url: str | None, region: str | None, input_fn=input) -> tuple[str, str]:
     """Resolve interactive IdC inputs; native `hermes auth` deliberately has no plugin-specific flags."""
     if start_url is None:
-        choice = _arrow_login_choice() or input_fn("\nSelect login method:\n\n  1. AWS Builder ID\n  2. IAM Identity Center\n\nChoice [1]: ").strip()
-        if choice not in {"", "1", "2"}:
-            raise KiroAuthError("Choose 1 for AWS Builder ID or 2 for IAM Identity Center")
+        choice = _arrow_login_choice() or input_fn(
+            "\nSelect login method:\n\n  1. AWS Builder ID\n  2. IAM Identity Center\n"
+            "  3. Google / GitHub (use kiro-cli login)\n\nChoice [1]: "
+        ).strip()
+        if choice not in {"", "1", "2", "3"}:
+            raise KiroAuthError("Choose 1 for AWS Builder ID, 2 for IAM Identity Center or 3 for Google / GitHub")
+        if choice == "3":
+            # The region comes from the profile ARN inside kiro-cli's token, so there is nothing to ask.
+            return SOCIAL_LOGIN, region or "us-east-1"
         start_url = BUILDER_ID_START_URL if choice in {"", "1"} else input_fn("\nIAM Identity Center start URL:\n\n> ").strip()
     if region is None:
         region = input_fn("\nIAM Identity Center region [us-east-1]:\n\n> ").strip() or "us-east-1"
@@ -421,7 +576,8 @@ def main() -> None:
         print("Kiro login saved in Hermes' credential pool.")
     else:
         creds = get_credentials()
-        print(f"logged in; IdC region={creds.region}; runtime region={creds.api_region}; expires_in={int(creds.expires_at-time.time())}s")
+        kind = f"{creds.social_provider or 'social'} login" if creds.is_social else "IdC"
+        print(f"logged in; {kind} region={creds.region}; runtime region={creds.api_region}; expires_in={int(creds.expires_at-time.time())}s")
 
 
 if __name__ == "__main__":

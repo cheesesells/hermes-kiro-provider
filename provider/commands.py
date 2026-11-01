@@ -19,7 +19,8 @@ if str(_HERE) not in sys.path:  # direct `python commands.py` run
 def _status_line() -> str:
     from credentials import get_credentials
     creds = get_credentials()
-    return (f"Kiro logged in; IdC region={creds.region}; runtime region={creds.api_region}; "
+    kind = f"{creds.social_provider or 'social'} login" if creds.is_social else "IdC"
+    return (f"Kiro logged in; {kind} region={creds.region}; runtime region={creds.api_region}; "
             f"expires_in={int(creds.expires_at - time.time())}s")
 
 

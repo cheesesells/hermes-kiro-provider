@@ -56,7 +56,8 @@ def test_login_selector_moves_with_arrow_keys_and_fallback_is_spaced():
     prompts = []
     values = iter(["", ""])
     prompt_login_inputs(None, None, lambda text: prompts.append(text) or next(values))
-    assert "\n  1. AWS Builder ID\n  2. IAM Identity Center\n\n" in prompts[0]
+    assert "\n  1. AWS Builder ID\n  2. IAM Identity Center\n  3. Google / GitHub (use kiro-cli login)\n\n" in prompts[0]
+    assert _next_login_choice(1, "down") == 2 and _next_login_choice(2, "down") == 2
 
 
 def test_request_hoists_system_and_never_sends_empty_user_content():
@@ -748,5 +749,155 @@ def test_concurrent_capability_updates_keep_all_models(monkeypatch, tmp_path):
         for thread in threads:
             thread.join()
         assert set(json.loads(cache_file.read_text())["additionalModelRequestFieldsUnsupportedModels"]) == {"one", "two"}
+    finally:
+        reset_hermes_home_override(token)
+
+
+# --- Google / GitHub sign-in imported from kiro-cli ---------------------------------------
+
+_SOCIAL_ARN = "arn:aws:codewhisperer:us-east-1:123456789012:profile/TESTPROFILE"
+
+
+def _kiro_cli_db(path, **overrides):
+    import sqlite3
+
+    token = {
+        "access_token": "social-access", "refresh_token": "social-refresh",
+        "expires_at": "2099-01-01T00:00:00.123456789Z", "provider": "google", "profile_arn": _SOCIAL_ARN,
+    }
+    token.update(overrides)
+    con = sqlite3.connect(path)
+    with con:
+        con.execute("CREATE TABLE auth_kv (key TEXT PRIMARY KEY, value TEXT)")
+        con.execute("INSERT INTO auth_kv VALUES (?, ?)", ("kirocli:social:token", json.dumps(token)))
+    con.close()
+    return path
+
+
+def test_kiro_cli_social_token_is_read_without_modifying_the_database(tmp_path):
+    db = _kiro_cli_db(tmp_path / "data.sqlite3")
+    before = db.read_bytes()
+    creds = credentials.read_kiro_cli_social(db)
+    assert db.read_bytes() == before
+    assert (creds.auth_method, creds.social_provider, creds.region) == ("social", "google", "us-east-1")
+    assert (creds.access_token, creds.refresh_token, creds.profile_arn) == ("social-access", "social-refresh", _SOCIAL_ARN)
+    assert creds.is_social and not creds.is_builder_id
+    assert creds.expires_at == pytest.approx(4_070_908_800.123456)
+
+
+def test_kiro_cli_social_token_errors_never_leak_token_values(tmp_path):
+    import sqlite3
+
+    with pytest.raises(KiroAuthError, match="kiro-cli login"):
+        credentials.read_kiro_cli_social(tmp_path / "missing.sqlite3")
+    empty = tmp_path / "empty.sqlite3"
+    con = sqlite3.connect(empty)
+    con.execute("CREATE TABLE auth_kv (key TEXT PRIMARY KEY, value TEXT)")
+    con.commit()
+    con.close()
+    with pytest.raises(KiroAuthError, match="no Google/GitHub sign-in"):
+        credentials.read_kiro_cli_social(empty)
+    for bad in ({"refresh_token": ""}, {"profile_arn": "not-an-arn"}):
+        with pytest.raises(KiroAuthError, match="incomplete") as caught:
+            credentials.read_kiro_cli_social(_kiro_cli_db(tmp_path / f"bad{len(bad['refresh_token'] if 'refresh_token' in bad else 'x')}.sqlite3", **bad))
+        assert "social-refresh" not in str(caught.value) and "social-access" not in str(caught.value)
+    garbage = tmp_path / "garbage.sqlite3"
+    garbage.write_bytes(b"this is not a sqlite database" * 20)
+    with pytest.raises(KiroAuthError, match="Could not read") as caught:
+        credentials.read_kiro_cli_social(garbage)
+    assert "this is not" not in str(caught.value)
+
+
+def test_social_refresh_posts_refresh_token_to_the_desktop_auth_service(monkeypatch):
+    seen = {}
+
+    def fake_request_json(method, url, *, body=None, headers=None, **_):
+        seen.update(method=method, url=url, body=json.loads(body), headers=headers)
+        return {"accessToken": "a2", "refreshToken": "r2", "expiresIn": 3600, "profileArn": _SOCIAL_ARN}
+
+    monkeypatch.setattr(credentials, "request_json", fake_request_json)
+    out = credentials._refresh_social_tokens("us-east-1", "social-refresh")
+    assert out["accessToken"] == "a2"
+    assert seen["method"] == "POST"
+    assert seen["url"] == "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken"
+    assert seen["body"] == {"refreshToken": "social-refresh"}
+    assert seen["headers"]["User-Agent"].startswith("KiroIDE-")
+
+
+@pytest.mark.parametrize(("status", "terminal"), [(400, True), (401, True), (403, True), (429, False), (503, False)])
+def test_social_refresh_failures_only_force_relogin_when_the_token_is_dead(monkeypatch, tmp_path, status, terminal):
+    from hermes_cli.auth_constants import AuthError
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    token = set_hermes_home_override(tmp_path)
+    try:
+        entry = credentials.persist_credentials(credentials.read_kiro_cli_social(_kiro_cli_db(tmp_path / "d.sqlite3")))
+        monkeypatch.setattr(credentials, "request_json", lambda *_a, **_k: (_ for _ in ()).throw(
+            credentials.KiroHTTPError(status, b'{"message":"nope"}')))
+        expected = AuthError if terminal else KiroAuthError
+        with pytest.raises(expected) as caught:
+            credentials.refresh_credential(entry)
+        assert isinstance(caught.value, AuthError) == terminal
+        assert "social-refresh" not in str(caught.value)
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_login_menu_choice_three_imports_kiro_cli_without_asking_for_a_region():
+    asked = []
+    values = iter(["3"])
+    assert prompt_login_inputs(None, None, lambda text: asked.append(text) or next(values)) == (
+        credentials.SOCIAL_LOGIN, "us-east-1")
+    assert len(asked) == 1
+
+
+def test_social_login_round_trips_through_the_credential_pool(monkeypatch, tmp_path):
+    from agent.credential_pool import load_pool
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    _register_local_profile()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    monkeypatch.setenv("KIRO_CLI_DB", str(_kiro_cli_db(tmp_path / "data.sqlite3")))
+    token = set_hermes_home_override(tmp_path / "profile")
+    try:
+        posts = []
+
+        def fake_refresh(region, refresh_token):
+            posts.append((region, refresh_token))
+            return {"accessToken": f"access-{len(posts)}", "expiresIn": 3600, "profileArn": _SOCIAL_ARN}
+
+        monkeypatch.setattr(credentials, "_refresh_social_tokens", fake_refresh)
+        monkeypatch.setattr(credentials, "prompt_login_inputs", lambda *_: (credentials.SOCIAL_LOGIN, "us-east-1"))
+        assert credentials.auth_handler("add", SimpleNamespace(label=None, priority=0)) is True
+        assert posts == [("us-east-1", "social-refresh")]  # login proves the token works once
+
+        row = load_pool("kiro").entries()[0]
+        assert (row.label, row.access_token, row.refresh_token) == ("kiro-google", "access-1", "social-refresh")
+        assert row.extra == {"auth_method": "social", "social_provider": "google", "region": "us-east-1", "profile_arn": _SOCIAL_ARN}
+        assert "client_secret" not in row.extra
+
+        creds = credentials.get_credentials()
+        assert (creds.is_social, creds.profile_arn, creds.access_token) == (True, _SOCIAL_ARN, "access-1")
+
+        refreshed = load_pool("kiro").try_refresh_matching(credential_id=row.id)
+        assert posts[-1] == ("us-east-1", "social-refresh")
+        assert (refreshed.access_token, refreshed.refresh_token) == ("access-2", "social-refresh")
+        assert refreshed.extra["profile_arn"] == _SOCIAL_ARN and refreshed.extra["auth_method"] == "social"
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_incomplete_social_pool_row_asks_for_a_new_login(monkeypatch, tmp_path):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    token = set_hermes_home_override(tmp_path)
+    try:
+        creds = credentials.read_kiro_cli_social(_kiro_cli_db(tmp_path / "d.sqlite3"))
+        creds.profile_arn = ""
+        entry = credentials.persist_credentials(creds)
+        with pytest.raises(KiroAuthError, match="profile_arn"):
+            credentials._entry_credentials(entry)
     finally:
         reset_hermes_home_override(token)
