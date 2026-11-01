@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+### Added
+
+- Google / GitHub sign-in (`hermes auth add kiro`, option 3): imports the social sign-in from Kiro CLI, stores it in Hermes' credential pool with the account's real profile ARN, and refreshes it through Kiro's desktop auth service.
+
 ## [1.0.1] - 2026-09-25
 
 ### Fixed

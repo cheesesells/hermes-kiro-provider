@@ -71,7 +71,9 @@ hermes --profile work gateway restart
 hermes auth add kiro
 ```
 
-Choose AWS Builder ID or corporate IAM Identity Center interactively. Provider-specific auth values are requested by the plugin because `hermes auth` intentionally does not add plugin-defined flags.
+Choose AWS Builder ID, corporate IAM Identity Center or Google / GitHub interactively. Provider-specific auth values are requested by the plugin because `hermes auth` intentionally does not add plugin-defined flags.
+
+**Google / GitHub.** This option does not run its own browser flow; it reuses the sign-in of [Kiro CLI](https://kiro.dev/docs/cli/). Run `kiro-cli login`, choose Google or GitHub, then run `hermes auth add kiro` and pick option 3. The plugin reads `kirocli:social:token` from kiro-cli's local database (read-only), proves it with one refresh, and keeps its own copy of the refresh token in Hermes' credential pool. It then refreshes through `prod.<region>.auth.desktop.kiro.dev/refreshToken`. Kiro does not rotate this refresh token, so the plugin and kiro-cli can each refresh independently; if kiro-cli is signed out or you log in again, repeat the two commands.
 
 Useful native commands:
 
