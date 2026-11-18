@@ -254,6 +254,22 @@ def test_usage_splits_included_credit_from_overage():
     assert snapshot.details == ("Credit extra usage: 860.55/10000; 34.4222627 USD",)
 
 
+def test_usage_reports_active_bonus_credits():
+    data = {"usageBreakdownList": [{
+        "displayName": "Credit", "currentUsage": 0, "usageLimit": 50, "nextDateReset": 1796083200.0,
+        "bonuses": [
+            {"displayName": "Promo", "status": "ACTIVE", "currentUsage": 208.55, "usageLimit": 1000, "expiresAt": 1796112000.0},
+            {"displayName": "Old", "status": "EXPIRED", "currentUsage": 5, "usageLimit": 10, "expiresAt": 1.0},
+        ],
+    }]}
+    usage = client.format_usage(data)
+    assert "  Bonus Promo: 208.55/1,000 (21%), 791.45 left; expires 2026-12-01 08:00 UTC" in usage
+    assert "Old" not in usage
+    snapshot = client.build_usage_snapshot(data)
+    assert [w.label for w in snapshot.windows] == ["Credit", "Credit bonus: Promo"]
+    assert snapshot.windows[1].detail == "208.55/1000"
+
+
 def test_native_auth_add_persists_opaque_pool_metadata(monkeypatch, tmp_path):
     from agent.credential_pool import load_pool
     from hermes_cli.runtime_provider import resolve_runtime_provider

@@ -114,6 +114,26 @@ def get_usage_limits() -> dict:
     return _rest(creds, "getUsageLimits", query)
 
 
+def _bonuses(bucket: dict) -> list:
+    """Active gifted/promo credit grants of one bucket as (name, used, limit, expires_at)."""
+    out = []
+    for bonus in bucket.get("bonuses") or []:
+        if not isinstance(bonus, dict) or str(bonus.get("status") or "ACTIVE").upper() != "ACTIVE":
+            continue
+        try:
+            used, limit = float(str(bonus.get("currentUsage"))), float(str(bonus.get("usageLimit")))
+        except (TypeError, ValueError):
+            continue
+        expires = None
+        try:
+            stamp = float(str(bonus.get("expiresAt")))
+            expires = datetime.fromtimestamp(stamp / 1000 if stamp > 10_000_000_000 else stamp, tz=timezone.utc)
+        except (TypeError, ValueError, OSError):
+            pass
+        out.append((str(bonus.get("displayName") or bonus.get("bonusCode") or "Bonus"), used, limit, expires))
+    return out
+
+
 def format_usage(data: dict) -> str:
     buckets = data.get("usageBreakdownList") or []
     if not isinstance(buckets, list) or not buckets:
@@ -144,6 +164,10 @@ def format_usage(data: dict) -> str:
             except (TypeError, ValueError, OSError):
                 pass
         lines.append(f"- {name}: {display(included)}/{display(limit)}{percent}" + (f"; resets {reset}" if reset else ""))
+        for b_name, b_used, b_limit, b_expires in _bonuses(bucket):
+            b_percent = f" ({b_used / b_limit * 100:.0f}%)" if b_limit > 0 else ""
+            expiry = f"; expires {b_expires:%Y-%m-%d %H:%M UTC}" if b_expires else ""
+            lines.append(f"  Bonus {b_name}: {display(b_used)}/{display(b_limit)}{b_percent}, {display(max(b_limit - b_used, 0))} left{expiry}")
 
         if any(key in bucket for key in ("currentOverages", "currentOveragesWithPrecision", "overageCap", "overageCharges")):
             overage = bucket.get("currentOveragesWithPrecision", bucket.get("currentOverages", 0))
@@ -201,6 +225,13 @@ def build_usage_snapshot(data: dict):
             reset_at=reset_at,
             detail=f"{included:g}/{limit:g}",
         ))
+        for b_name, b_used, b_limit, b_expires in _bonuses(bucket):
+            windows.append(AccountUsageWindow(
+                label=f"{name} bonus: {b_name}",
+                used_percent=b_used / b_limit * 100 if b_limit > 0 else None,
+                reset_at=b_expires,
+                detail=f"{b_used:g}/{b_limit:g}",
+            ))
         overage = bucket.get("currentOveragesWithPrecision", bucket.get("currentOverages"))
         if overage is not None:
             cap = bucket.get("overageCapWithPrecision", bucket.get("overageCap"))
