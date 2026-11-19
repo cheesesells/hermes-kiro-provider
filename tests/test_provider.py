@@ -70,6 +70,34 @@ def test_request_hoists_system_and_never_sends_empty_user_content():
     assert "system" not in json.dumps(request)
 
 
+def test_request_forwards_data_url_images_and_skips_remote_urls():
+    parts = [
+        {"type": "text", "text": "what is this?"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}},
+        {"type": "image_url", "image_url": {"url": "data:image/jpg;base64,REVG"}},
+        {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+        {"type": "image_url", "image_url": {"url": "data:image/bmp;base64,AAAA"}},
+    ]
+    request = build_request([{"role": "user", "content": parts}], [], "claude-sonnet-5.5", None, "c")
+    message = request["conversationState"]["currentMessage"]["userInputMessage"]
+    assert message["content"] == "what is this?"
+    assert message["images"] == [
+        {"format": "png", "source": {"bytes": "QUJD"}},
+        {"format": "jpeg", "source": {"bytes": "REVG"}},
+    ]
+
+
+def test_request_forwards_images_in_history_turns_and_omits_key_when_none():
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "look"}, {"type": "image_url", "image_url": {"url": "data:image/webp;base64,WFla"}}]},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "thanks"},
+    ]
+    state = build_request(messages, [], "claude-sonnet-5.5", None, "c")["conversationState"]
+    assert state["history"][0]["userInputMessage"]["images"] == [{"format": "webp", "source": {"bytes": "WFla"}}]
+    assert "images" not in state["currentMessage"]["userInputMessage"]
+
+
 def test_nonstream_facade_returns_openai_shape(monkeypatch):
     instance = client.KiroClient()
     monkeypatch.setattr(instance, "_events", lambda _: iter([

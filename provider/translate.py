@@ -18,6 +18,31 @@ def _text(content: Any) -> str:
     return ""
 
 
+_IMAGE_FORMATS = {"png": "png", "jpeg": "jpeg", "jpg": "jpeg", "gif": "gif", "webp": "webp"}
+
+
+def _images(content: Any) -> list[dict]:
+    """Collect OpenAI-style data-URL image parts as Kiro `images` entries.
+
+    Remote http(s) URLs are skipped: Kiro takes raw base64 bytes only.
+    """
+    found: list[dict] = []
+    if not isinstance(content, list):
+        return found
+    for part in content:
+        if not isinstance(part, dict) or part.get("type") not in {"image_url", "input_image"}:
+            continue
+        ref = part.get("image_url")
+        url = ref.get("url") if isinstance(ref, dict) else ref
+        if not isinstance(url, str) or not url.startswith("data:image/") or ";base64," not in url:
+            continue
+        header, data = url.split(";base64,", 1)
+        fmt = _IMAGE_FORMATS.get(header[len("data:image/"):].lower())
+        if fmt and data:
+            found.append({"format": fmt, "source": {"bytes": data}})
+    return found
+
+
 def _tool_specs(tools: Any, messages: list[dict]) -> list[dict]:
     """Keep definitions for replayed tool calls; Kiro rejects orphaned results."""
     specs: dict[str, dict] = {}
@@ -80,7 +105,10 @@ def build_request(messages: list[dict], tools: Any, model: str, effort: dict | N
                 content = f"{system_pending}\n\n{content}".strip()
                 system_pending = ""
             content = content or _EMPTY
-            history.append({"userInputMessage": {"content": content, "modelId": model, "origin": "KIRO_CLI"}})
+            entry: dict[str, Any] = {"content": content, "modelId": model, "origin": "KIRO_CLI"}
+            if images := _images(message.get("content")):
+                entry["images"] = images
+            history.append({"userInputMessage": entry})
         elif role == "tool":
             grouped = [message]
             while index + 1 < len(conversation) and conversation[index + 1].get("role") == "tool":
@@ -99,6 +127,8 @@ def build_request(messages: list[dict], tools: Any, model: str, effort: dict | N
             content = f"{system_pending}\n\n{content}".strip()
         content = content or _EMPTY
         user = {"content": content, "modelId": model, "origin": "KIRO_CLI"}
+        if images := _images(current.get("content")):
+            user["images"] = images
     if specs := _tool_specs(tools, conversation + current_tools + ([] if current_tools else [current])):
         context["tools"] = specs
     if context:
