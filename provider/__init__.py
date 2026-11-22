@@ -18,10 +18,29 @@ from credentials import auth_handler, refresh_credential  # noqa: E402
 _FALLBACK_MODELS = ("claude-sonnet-4.5", "claude-haiku-4.5", "gpt-5.6-terra")
 _CATALOG_MODELS = _FALLBACK_MODELS
 _CATALOG_AT = 0.0
-_MODEL_CAPABILITIES = {
-    model: {"supports_vision": False, "supports_tools": True}
-    for model in _FALLBACK_MODELS
-}
+# Kiro rejects image blocks for its open-weight families; unknown ids default to
+# text-only so Hermes summarizes the image instead of sending a block Kiro 400s.
+_VISION_PREFIXES = ("claude", "gpt")
+
+
+def _supports_vision(model: str) -> bool:
+    """Claude and GPT models on Kiro accept inline images; ``auto`` routes to one of them."""
+    name = str(model or "").strip().lower()
+    return name == "auto" or name.startswith(_VISION_PREFIXES)
+
+
+class _ModelCapabilities(dict):
+    """Per-model capabilities, answered for any catalog id (the live catalog changes under us)."""
+
+    def get(self, model, default=None):
+        if model in self:
+            return self[model]
+        return {"supports_vision": _supports_vision(model), "supports_tools": True} if model else default
+
+
+_MODEL_CAPABILITIES = _ModelCapabilities(
+    {model: {"supports_vision": _supports_vision(model), "supports_tools": True} for model in _FALLBACK_MODELS}
+)
 
 
 def _catalog_models() -> tuple[str, ...]:
@@ -62,7 +81,7 @@ profile = KiroProfile(
     name="kiro",
     aliases=("kiro-native",),
     display_name="Kiro (native)",
-    description="Kiro via direct HTTPS and IAM Identity Center.",
+    description="Kiro via direct HTTPS; sign in with AWS Builder ID, IAM Identity Center, Google or GitHub.",
     signup_url="https://kiro.dev",
     auth_type="oauth_device_code",
     auth_handler=auth_handler,
@@ -70,7 +89,8 @@ profile = KiroProfile(
     base_url="https://runtime.us-east-1.kiro.dev",
     hostname="runtime.us-east-1.kiro.dev",
     supports_health_check=False,
-    supports_vision=False,
+    # Image parts in tool results are forwarded as Kiro image blocks (see translate._images).
+    supports_vision=True,
     fallback_models=_FALLBACK_MODELS,
     model_capabilities=_MODEL_CAPABILITIES,
     default_aux_model="claude-haiku-4.5",

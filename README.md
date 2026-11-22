@@ -8,7 +8,7 @@ Native Kiro model-provider plugin for Hermes. It connects directly to Kiro over 
 - **Credential storage:** OAuth tokens and Kiro metadata live in Hermes' profile-scoped `auth.json` credential pool, including multi-account priority and safe cross-process refresh
 - **Usage:** the normal `/usage` command renders Kiro allowances and reset times
 - **Models:** live Kiro models appear in main and auxiliary model pickers, with curated offline fallbacks
-- **Capabilities:** Hermes knows the bundled fallback models support tools and are text-only
+- **Capabilities:** Hermes knows which bundled fallback models support tools; Claude and GPT models also declare vision, while DeepSeek, MiniMax, GLM and Qwen stay text-only
 - **Transport:** direct Kiro event streams, tool calls/results, and automatic 401 recovery
 
 ```mermaid
@@ -41,7 +41,7 @@ The plugin no longer reads the old `$HERMES_HOME/kiro/credentials.json` file, th
 
 ## Install
 
-Use Hermes' built-in plugin installer (Hermes Agent 0.21.3 or newer):
+Use Hermes' built-in plugin installer (Hermes Agent 0.23.1 or newer):
 
 ```bash
 hermes plugins install kiro-provider
@@ -71,9 +71,9 @@ hermes --profile work gateway restart
 hermes auth add kiro
 ```
 
-Choose AWS Builder ID, corporate IAM Identity Center or Google / GitHub interactively. Provider-specific auth values are requested by the plugin because `hermes auth` intentionally does not add plugin-defined flags.
+Choose AWS Builder ID, corporate IAM Identity Center, Google or GitHub interactively. Google and GitHub show a URL and a code to enter in the browser; the plugin stores and refreshes the tokens in the Hermes credential pool. They use Kiro's undocumented desktop auth endpoints and always sign in to `us-east-1`. Provider-specific auth values are requested by the plugin because `hermes auth` intentionally does not add plugin-defined flags.
 
-**Google / GitHub.** This option does not run its own browser flow; it reuses the sign-in of [Kiro CLI](https://kiro.dev/docs/cli/). Run `kiro-cli login`, choose Google or GitHub, then run `hermes auth add kiro` and pick option 3. The plugin reads `kirocli:social:token` from kiro-cli's local database (read-only), proves it with one refresh, and keeps its own copy of the refresh token in Hermes' credential pool. It then refreshes through `prod.<region>.auth.desktop.kiro.dev/refreshToken`. Kiro does not rotate this refresh token, so the plugin and kiro-cli can each refresh independently; if kiro-cli is signed out or you log in again, repeat the two commands.
+**Importing a kiro-cli login.** Menu entry 5 does not run a browser flow; it reuses the sign-in of [Kiro CLI](https://kiro.dev/docs/cli/). Run `kiro-cli login`, choose Google or GitHub, then run `hermes auth add kiro` and pick option 5. The plugin reads `kirocli:social:token` from kiro-cli's local database (read-only), proves it with one refresh, and keeps its own copy of the refresh token in Hermes' credential pool. Kiro has not rotated this refresh token in testing, so the plugin and kiro-cli can each refresh independently; if kiro-cli is signed out or you log in again, repeat the two commands.
 
 Useful native commands:
 

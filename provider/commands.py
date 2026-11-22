@@ -19,8 +19,7 @@ if str(_HERE) not in sys.path:  # direct `python commands.py` run
 def _status_line() -> str:
     from credentials import get_credentials
     creds = get_credentials()
-    kind = f"{creds.social_provider or 'social'} login" if creds.is_social else "IdC"
-    return (f"Kiro logged in; {kind} region={creds.region}; runtime region={creds.api_region}; "
+    return (f"Kiro logged in; region={creds.region}; runtime region={creds.api_region}; "
             f"expires_in={int(creds.expires_at - time.time())}s")
 
 
@@ -28,9 +27,11 @@ def _status_line() -> str:
 
 def setup_parser(parser) -> None:
     sub = parser.add_subparsers(dest="kiro_command", required=True)
-    login_parser = sub.add_parser("login", help="Sign in to Kiro via IAM Identity Center")
-    login_parser.add_argument("--start-url", help="IAM Identity Center URL; omit for interactive setup")
-    login_parser.add_argument("--region", help="IAM Identity Center region; omit for interactive setup")
+    login_parser = sub.add_parser("login", help="Sign in to Kiro")
+    login_parser.add_argument("--start-url", help="IAM Identity Center URL, or social:google / social:github; omit for interactive setup")
+    login_parser.add_argument(
+        "--region", help="IAM Identity Center region (ignored for Google and GitHub); omit for interactive setup"
+    )
     sub.add_parser("status", help="Show Kiro login status")
     sub.add_parser("usage", help="Show Kiro usage allowances")
     logout_parser = sub.add_parser("logout", help="Forget Hermes' native Kiro login")

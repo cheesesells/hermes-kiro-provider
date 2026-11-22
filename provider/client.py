@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import collections.abc
 import json
+import logging
 import time
 from datetime import datetime, timezone
 import urllib.parse
@@ -19,8 +21,65 @@ from transport import KiroHTTPError, request, request_json
 from translate import build_request
 
 _FALLBACK = ("claude-sonnet-4.5", "claude-haiku-4.5", "gpt-5.6-terra")
+_LOG = logging.getLogger(__name__)
 _END = object()
-_UNSUPPORTED_ADDITIONAL_FIELDS = "additionalModelRequestFields is not supported for this model"
+# Kiro reports a model that cannot take additionalModelRequestFields in two shapes:
+#   "...additionalModelRequestFields is not supported for this model"  (older models)
+#   "Invalid additionalModelRequestFields: property 'enabled' is not defined in the schema..."  (4.6+)
+# Both arrive with reason REQUEST_BODY_INVALID, so match on the field name rather than one sentence.
+_ADDITIONAL_FIELDS_KEY = "additionalmodelrequestfields"
+# The branded runtime gateway rejects a profileArn-less Builder ID request with
+# 400 "profileArn is required for this request". Builder ID has no discoverable
+# profile, so official clients send this fixed placeholder on streaming calls
+# (embedded in the official kiro-cli 2.8.0 binary, fig_api_client::profile_resolver).
+# Do not attach it to REST calls: ListAvailableModels/getUsageLimits reject it.
+BUILDER_ID_PROFILE_ARN = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
+
+
+def _rejects_disabled_thinking(exc: KiroHTTPError) -> bool:
+    if exc.status != 400:
+        return False
+    text = exc.body.decode("utf-8", "replace") if isinstance(exc.body, (bytes, bytearray)) else str(exc.body)
+    return "additionalModelRequestFields" in text and "enumeration" in text and '"adaptive"' in text.replace('\\"', '"')
+
+
+_NATIVE_REASONING_KEYS = {"thinking", "output_config", "reasoning"}
+_CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+_GPT_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
+_EFFORT_ALIASES = {"minimal": "low", "ultra": "max"}
+
+
+def _kiro_reasoning_fields(model: str, config: Any) -> dict | None:
+    """Map Hermes' generic ``{"enabled", "effort"}`` reasoning config onto Kiro's per-family schema.
+
+    Kiro validates ``additionalModelRequestFields`` strictly: Claude accepts
+    ``thinking.type`` (adaptive|disabled) and ``output_config.effort``; GPT accepts
+    ``reasoning.effort``. Anything else is a 400, which broke title generation
+    (Hermes sends ``{"enabled": False}``). Native-shaped dicts pass through.
+    """
+    if not isinstance(config, dict) or not config:
+        return None
+    if set(config) <= _NATIVE_REASONING_KEYS:
+        return dict(config)
+    if not ({"enabled", "effort"} & set(config)):
+        # Unknown shape: forward untouched so provider-specific configs keep working.
+        return dict(config)
+    family = (model or "").lower()
+    effort = str(config.get("effort") or "").strip().lower()
+    effort = _EFFORT_ALIASES.get(effort, effort)
+    disabled = config.get("enabled") is False or effort == "none"
+    if family.startswith("claude"):
+        if disabled:
+            return {"thinking": {"type": "disabled"}}
+        fields: dict = {"thinking": {"type": "adaptive"}}
+        if effort in _CLAUDE_EFFORTS:
+            fields["output_config"] = {"effort": effort}
+        return fields
+    if family.startswith("gpt"):
+        if disabled:
+            return {"reasoning": {"effort": "none"}}
+        return {"reasoning": {"effort": effort}} if effort in _GPT_EFFORTS else None
+    return None
 
 
 def _model_id(body: dict) -> str:
@@ -51,7 +110,7 @@ def _rejects_additional_model_request_fields(exc: KiroHTTPError) -> bool:
 
     values = list(strings(payload))
     return "REQUEST_BODY_INVALID" in values and any(
-        _UNSUPPORTED_ADDITIONAL_FIELDS.casefold() in value.casefold() for value in values
+        _ADDITIONAL_FIELDS_KEY in value.casefold() for value in values
     )
 
 
@@ -83,10 +142,15 @@ def _management(creds, target: str, payload: dict) -> dict:
     )
 
 
+def _rest_host(region: str) -> str:
+    """us-east-1 keeps its historical host; other regions are served by q.<region>."""
+    return "codewhisperer.us-east-1.amazonaws.com" if region == "us-east-1" else f"q.{region}.amazonaws.com"
+
+
 def _rest(creds, path: str, query: dict[str, str]) -> dict:
     return request_json(
         "GET",
-        f"https://codewhisperer.us-east-1.amazonaws.com/{path}?{urllib.parse.urlencode(query)}",
+        f"https://{_rest_host(creds.api_region)}/{path}?{urllib.parse.urlencode(query)}",
         headers=_headers(creds),
     )
 
@@ -100,8 +164,11 @@ def list_model_ids() -> list[str]:
             query["profileArn"] = profile_arn
         data = _rest(creds, "ListAvailableModels", query)
         models = [str(m["modelId"]) for m in data.get("models") or [] if isinstance(m, dict) and isinstance(m.get("modelId"), str)]
+        if not models:
+            _LOG.warning("Kiro returned no models; using the built-in fallback list.")
         return models or list(_FALLBACK)
-    except Exception:
+    except Exception as exc:
+        _LOG.warning("Kiro model discovery failed (%s); using the built-in fallback list.", exc)
         return list(_FALLBACK)
 
 
@@ -309,6 +376,52 @@ class _HybridStream:
         return iterate()
 
 
+class _LazyResponse(collections.abc.Coroutine):
+    """Result of a non-stream call made while an event loop is running on this thread.
+
+    Awaiting it (or wrapping it in a task) runs the request in a worker thread, as before.
+    Reading an attribute instead runs the request inline, for synchronous callers that happen
+    to sit on a thread with a running loop (e.g. Hermes auxiliary title generation).
+    """
+    def __init__(self, fn, *args) -> None:
+        self._fn, self._args = fn, args
+        self._result = None
+        self._coro = None
+
+    def _resolve(self):
+        if self._result is None:
+            self._result = self._fn(*self._args)
+        return self._result
+
+    def _driver(self):
+        if self._coro is None:
+            self._coro = self._await_in_thread()
+        return self._coro
+
+    async def _await_in_thread(self):
+        if self._result is None:
+            self._result = await asyncio.to_thread(self._fn, *self._args)
+        return self._result
+
+    def __await__(self):
+        return self._driver().__await__()
+
+    def send(self, value):
+        return self._driver().send(value)
+
+    def throw(self, *args):
+        return self._driver().throw(*args)
+
+    def close(self):
+        if self._coro is not None:
+            self._coro.close()
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._resolve(), name)
+
+
 class KiroClient:
     HERMES_SKIP_TRANSPORT_WRAP = True
     HERMES_SKIP_ASYNC_WRAP = True
@@ -333,6 +446,8 @@ class KiroClient:
         # ponytail: Builder ID rejects profile discovery; corporate IdC requires the discovered ARN.
         if profile_arn := _ensure_profile_arn(creds):
             body["profileArn"] = profile_arn
+        elif getattr(creds, "is_builder_id", False):
+            body["profileArn"] = BUILDER_ID_PROFILE_ARN
         headers = _headers(
             creds,
             accept="application/vnd.amazon.eventstream",
@@ -359,12 +474,25 @@ class KiroClient:
         stale_access_token = ""
         retried_auth = False
         retried_without_additional_fields = False
+        retried_adaptive_thinking = False
         while True:
             try:
                 opened = self._open(body, force_refresh=retried_auth, stale_access_token=stale_access_token)
                 response, stale_access_token = opened if isinstance(opened, tuple) else (opened, "")
                 break
             except KiroHTTPError as exc:
+                fields = body.get("additionalModelRequestFields")
+                if (
+                    not retried_adaptive_thinking
+                    and isinstance(fields, dict)
+                    and (fields.get("thinking") or {}).get("type") == "disabled"
+                    and _rejects_disabled_thinking(exc)
+                ):
+                    # Some Claude models (e.g. opus-5.5) only allow adaptive thinking; keep it cheap instead.
+                    body = dict(body)
+                    body["additionalModelRequestFields"] = {"thinking": {"type": "adaptive"}, "output_config": {"effort": "low"}}
+                    retried_adaptive_thinking = True
+                    continue
                 if (
                     not retried_without_additional_fields
                     and "additionalModelRequestFields" in body
@@ -378,7 +506,7 @@ class KiroClient:
                     retried_without_additional_fields = True
                     continue
                 if exc.status not in (401, 403) or retried_auth:
-                    raise KiroAuthError(f"Kiro runtime failed ({exc.status}): {exc.body.decode('utf-8', 'replace')[:500]}") from exc
+                    raise KiroAuthError(f"Kiro runtime failed ({exc.status}): {exc.body.decode('utf-8', 'replace')[:500]}", status=exc.status) from exc
                 stale_access_token = exc.access_token
                 retried_auth = True
         if response is None:
@@ -408,7 +536,7 @@ class KiroClient:
                 release()
 
     def _create(self, *, model: str, messages: list[dict], stream: bool = False, tools: Any = None, extra_body: dict | None = None, **_: Any):
-        effort = (extra_body or {}).get("reasoning")
+        effort = _kiro_reasoning_fields(model, (extra_body or {}).get("reasoning"))
         if effort and not additional_model_request_fields_supported(model):
             effort = None
         body = build_request(messages, tools, model, effort)
@@ -418,7 +546,7 @@ class KiroClient:
             asyncio.get_running_loop()
         except RuntimeError:
             return self._complete(model, body)
-        return asyncio.to_thread(self._complete, model, body)
+        return _LazyResponse(self._complete, model, body)
 
     @staticmethod
     def _add_tool_event(calls: dict[str, dict[str, str]], data: dict) -> None:
@@ -455,6 +583,8 @@ class KiroClient:
                     tools_sent = sent = True
                 yield _chunk(model, {}, "tool_calls")
                 return
+            elif event == "metadataEvent" and str(data.get("stopReason") or "").upper() == "CONTENT_FILTERED":
+                raise KiroAuthError("Kiro declined the request (CONTENT_FILTERED)")
             elif event in {"error", "exception"} or data.get("error"):
                 raise KiroAuthError(f"Kiro stream error: {data.get('message') or data.get('error')}")
         if calls:
