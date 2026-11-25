@@ -89,6 +89,11 @@ class Credentials:
 
     @property
     def api_region(self) -> str:
+        # IdC and Kiro profile regions are independent; never change the OIDC region.
+        if self.profile_arn and not self.is_social and not self.is_builder_id:
+            parts = self.profile_arn.split(":", 5)
+            if len(parts) == 6 and parts[:3] == ["arn", "aws", "codewhisperer"] and parts[3] in _API_REGIONS:
+                return parts[3]
         return runtime_region(self.region)
 
     @property
@@ -117,6 +122,12 @@ def runtime_region(region: str) -> str:
     if region in _REGION_MAP:
         return _REGION_MAP[region]
     raise KiroAuthError(f"Unsupported IAM Identity Center region: {region!r}")
+
+
+def profile_regions(region: str) -> tuple[str, ...]:
+    """Search the existing preferred region first, then the other supported Kiro regions."""
+    first = runtime_region(region)
+    return (first, *sorted(_API_REGIONS - {first}))
 
 
 def validate_start_url(value: str) -> str:

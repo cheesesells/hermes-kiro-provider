@@ -16,7 +16,7 @@ from capabilities import (
     additional_model_request_fields_supported,
     mark_additional_model_request_fields_unsupported,
 )
-from credentials import KiroAuthError, get_credentials, remember_profile_arn
+from credentials import KiroAuthError, get_credentials, profile_regions, remember_profile_arn, runtime_region
 from transport import KiroHTTPError, request, request_json
 from translate import build_request
 
@@ -132,11 +132,12 @@ def _headers(creds, *, accept: str = "application/json", target: str = "") -> di
     return headers
 
 
-def _management(creds, target: str, payload: dict) -> dict:
+def _management(creds, target: str, payload: dict, *, region: str = "") -> dict:
     """Kiro's target-dispatched control plane."""
+    region = runtime_region(region or creds.api_region)
     return request_json(
         "POST",
-        f"https://management.{creds.api_region}.kiro.dev/",
+        f"https://management.{region}.kiro.dev/",
         body=json.dumps(payload).encode(),
         headers=_headers(creds, target=target),
     )
@@ -329,13 +330,16 @@ def _ensure_profile_arn(creds) -> str:
         return creds.profile_arn
     if getattr(creds, "is_builder_id", False):
         return ""
-    data = _management(creds, "KiroControlPlaneBearerService.ListAvailableProfiles", {})
-    for profile in data.get("profiles") or []:
-        if isinstance(profile, dict) and (arn := str(profile.get("profileArn") or profile.get("arn") or "").strip()):
-            creds.profile_arn = arn
-            remember_profile_arn(creds)
-            return arn
-    raise KiroAuthError("Kiro IAM Identity Center returned no profile ARN")
+    regions = profile_regions(creds.region)
+    for region in regions:
+        # ponytail: fall through on empty results only; HTTP/auth errors must propagate.
+        data = _management(creds, "KiroControlPlaneBearerService.ListAvailableProfiles", {}, region=region)
+        for profile in data.get("profiles") or []:
+            if isinstance(profile, dict) and (arn := str(profile.get("profileArn") or profile.get("arn") or "").strip()):
+                creds.profile_arn = arn
+                remember_profile_arn(creds)
+                return arn
+    raise KiroAuthError(f"Kiro returned no profile ARN for this IAM Identity Center login in {' or '.join(regions)}")
 
 
 def _chunk(model: str, delta: dict, finish: str | None = None) -> SimpleNamespace:

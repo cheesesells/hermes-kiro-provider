@@ -235,10 +235,10 @@ def test_idc_discovers_profile_arn_without_prompting(monkeypatch):
     instance = client.KiroClient()
     captured = {}
     calls = []
-    creds = SimpleNamespace(api_region="us-east-1", access_token="token", profile_arn="", is_builder_id=False)
+    creds = SimpleNamespace(region="us-east-1", api_region="us-east-1", access_token="token", profile_arn="", is_builder_id=False)
     monkeypatch.setattr(client, "get_credentials", lambda **_: creds)
     monkeypatch.setattr(client, "remember_profile_arn", lambda _: None)
-    monkeypatch.setattr(client, "_management", lambda *_: calls.append(True) or {"profiles": [{"arn": "arn:aws:codewhisperer:us-east-1:1:profile/team"}]})
+    monkeypatch.setattr(client, "_management", lambda *_, **__: calls.append(True) or {"profiles": [{"arn": "arn:aws:codewhisperer:us-east-1:1:profile/team"}]})
     monkeypatch.setattr(client, "request", lambda method, url, **kwargs: captured.update(method=method, url=url, **kwargs) or SimpleNamespace())
     instance._open({"conversationState": {}})
     assert calls and creds.profile_arn.endswith("profile/team")
@@ -268,6 +268,111 @@ def test_rest_requests_use_the_account_region_host(monkeypatch):
         "https://codewhisperer.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR",
         "https://q.eu-central-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR",
     ]
+
+
+@pytest.mark.parametrize("idc_region,profile_region", [
+    ("eu-west-1", "us-east-1"),
+    ("us-east-1", "eu-central-1"),
+    ("eu-west-1", "eu-central-1"),
+    ("us-east-1", "us-east-1"),
+])
+def test_idc_profile_region_routes_all_apis_and_preserves_refresh(monkeypatch, env, idc_region, profile_region):
+    """Discover once, then fresh pool reads route every Kiro API by ARN, not IdC region."""
+    monkeypatch.setattr(credentials, "_PROFILE_ARNS", {})
+    entry = credentials.persist_credentials(credentials.Credentials(
+        "fake-access", "fake-refresh", "client", "secret", idc_region,
+        "https://example.awsapps.com/start", time.time() + 3600,
+    ))
+    arn = f"arn:aws:codewhisperer:{profile_region}:000000000000:profile/team"
+    management, rest, runtime = [], [], []
+
+    def fake_json(method, url, **kwargs):
+        parsed = client.urllib.parse.urlsplit(url)
+        if method == "POST":
+            management.append(parsed.hostname)
+            profiles = [{"profileArn": arn}] if parsed.hostname == f"management.{profile_region}.kiro.dev" else []
+            return {"profiles": profiles}
+        query = client.urllib.parse.parse_qs(parsed.query)
+        assert query["profileArn"] == [arn]
+        rest.append((parsed.hostname, parsed.path))
+        return {"models": [{"modelId": "live-regional-model"}], "usageBreakdownList": []}
+
+    monkeypatch.setattr(client, "request_json", fake_json)
+    monkeypatch.setattr(client, "request", lambda method, url, **kw: runtime.append((url, json.loads(kw["body"]))) or SimpleNamespace())
+    assert client.list_model_ids() == ["live-regional-model"]
+    assert client.get_usage_limits()["usageBreakdownList"] == []
+    client.KiroClient()._open({"conversationState": {}})
+    first = runtime_region(idc_region)
+    expected = [f"management.{first}.kiro.dev"]
+    if first != profile_region:
+        expected.append(f"management.{profile_region}.kiro.dev")
+    assert management == expected
+    host = "codewhisperer.us-east-1.amazonaws.com" if profile_region == "us-east-1" else "q.eu-central-1.amazonaws.com"
+    assert rest == [(host, "/ListAvailableModels"), (host, "/getUsageLimits")]
+    assert runtime == [(f"https://runtime.{profile_region}.kiro.dev/generateAssistantResponse",
+                        {"conversationState": {}, "profileArn": arn})]
+    fresh = credentials.get_credentials()
+    assert (fresh.region, fresh.api_region, fresh.profile_arn) == (idc_region, profile_region, arn)
+    management.clear()
+    client._management(fresh, "test", {})
+    assert management == [f"management.{profile_region}.kiro.dev"]
+    net = fake_net(monkeypatch, {"accessToken": "refreshed", "expiresIn": 3600})
+    assert credentials.refresh_credential(entry)["access_token"] == "refreshed"
+    assert net.calls[0].url == f"https://oidc.{idc_region}.amazonaws.com/token"
+
+
+@pytest.mark.parametrize("failure", [None, 401, 403, 429, 503])
+def test_idc_profile_lookup_empty_or_http_error_never_sends_runtime(monkeypatch, failure):
+    creds = credentials.Credentials("a", "r", "id", "secret", "eu-west-1", "https://example.awsapps.com/start", 0)
+    calls = []
+    error = client.KiroHTTPError(failure, b"lookup failed") if failure else None
+
+    def fake_json(method, url, **kwargs):
+        calls.append(url)
+        if error:
+            raise error
+        return {"profiles": []}
+
+    monkeypatch.setattr(client, "get_credentials", lambda **_: creds)
+    monkeypatch.setattr(client, "request_json", fake_json)
+    monkeypatch.setattr(client, "request", lambda *a, **kw: pytest.fail("must not send runtime request"))
+    with pytest.raises(client.KiroHTTPError if error else KiroAuthError) as caught:
+        client.KiroClient()._open({})
+    assert calls[0] == "https://management.eu-central-1.kiro.dev/"
+    if error:
+        assert caught.value is error and len(calls) == 1
+    else:
+        assert calls == ["https://management.eu-central-1.kiro.dev/", "https://management.us-east-1.kiro.dev/"]
+        assert "eu-central-1" in str(caught.value) and "us-east-1" in str(caught.value)
+
+
+@pytest.mark.parametrize("start_url,region,arn", [
+    (BUILDER_ID_START_URL, "us-east-1", ""),
+    (BUILDER_ID_START_URL, "eu-west-1", ""),
+    (credentials.SOCIAL_START_URL, "us-east-1", "arn:aws:codewhisperer:eu-central-1:000000000000:profile/social"),
+])
+def test_non_idc_profile_routing_is_unchanged(monkeypatch, start_url, region, arn):
+    creds = credentials.Credentials("a", "r", "id", "secret", region, start_url, 0, profile_arn=arn)
+    calls = []
+    monkeypatch.setattr(client, "get_credentials", lambda **_: creds)
+    monkeypatch.setattr(client, "_management", lambda *a, **kw: pytest.fail("no profile discovery"))
+    monkeypatch.setattr(client, "request_json", lambda method, url, **kw: calls.append(url) or {})
+    monkeypatch.setattr(client, "request", lambda method, url, **kw: calls.append(url) or SimpleNamespace())
+    client.get_usage_limits()
+    body = {}
+    client.KiroClient()._open(body)
+    api_region = runtime_region(region)
+    assert creds.api_region == api_region
+    assert calls[0].startswith(f"https://{client._rest_host(api_region)}/getUsageLimits?")
+    assert ("profileArn=" in calls[0]) is bool(arn)
+    assert calls[1] == f"https://runtime.{api_region}.kiro.dev/generateAssistantResponse"
+    assert body["profileArn"] == (arn or client.BUILDER_ID_PROFILE_ARN)
+
+
+@pytest.mark.parametrize("arn", ["garbage", "arn:aws:codewhisperer:attacker.example:1:profile/x"])
+def test_profile_arn_cannot_supply_an_untrusted_host_region(arn):
+    creds = credentials.Credentials("a", "r", "id", "secret", "eu-west-1", "https://example.awsapps.com/start", 0, profile_arn=arn)
+    assert creds.api_region == "eu-central-1"
 
 
 def test_model_discovery_failure_falls_back_and_logs(monkeypatch, caplog):

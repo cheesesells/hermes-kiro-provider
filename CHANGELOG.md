@@ -13,6 +13,17 @@ All notable changes to this project are documented here.
 
 - Pool rows written by the earlier kiro-cli import (`auth_method: social`) are still read.
 
+## [1.2.1] - 2026-11-23
+
+### Fixed
+
+- Discover IAM Identity Center Kiro profiles across the supported commercial regions when the preferred region returns no profile.
+- Route management, model discovery, usage and inference using the discovered profile ARN's allowlisted region, while keeping the original IdC region for login and token refresh.
+- Preserve HTTP/auth failures and existing Builder ID and Google/GitHub routing; empty-profile errors name the regions searched.
+
+No credential migration, new dependencies or configuration changes are required.
+
+
 ## [1.2.0] - 2026-11-17
 
 ### Added
