@@ -13,6 +13,13 @@ All notable changes to this project are documented here.
 
 - Pool rows written by the earlier kiro-cli import (`auth_method: social`) are still read.
 
+## [1.2.2] - 2026-11-27
+
+### Fixed
+
+- Send the full Kiro IDE client fingerprint (`aws-sdk-js` User-Agent pair with IDE version and a stable 64-hex machine id) on management, model discovery, usage and streaming calls, so requests pass Kiro's client-version gate that answers 403 `FEATURE_NOT_SUPPORTED` ("This version of Kiro is no longer supported") to non-IDE identities (#12).
+- User-Agent now reflects the host OS instead of a fake `aws-sdk-python/1.0` string.
+
 ## [1.2.1] - 2026-11-23
 
 ### Fixed

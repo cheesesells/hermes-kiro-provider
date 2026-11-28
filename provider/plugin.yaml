@@ -1,6 +1,6 @@
 name: kiro-provider
 kind: model-provider
-version: 1.2.1
+version: 1.2.2
 requires_hermes: ">=0.23.1"
 description: Native Kiro provider with Hermes auth, usage, model catalog, and capability hooks.
 author: anpicasso

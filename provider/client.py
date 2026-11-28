@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import asyncio
 import collections.abc
+import hashlib
 import json
 import logging
+import platform
 import time
 from datetime import datetime, timezone
 import urllib.parse
@@ -114,14 +116,43 @@ def _rejects_additional_model_request_fields(exc: KiroHTTPError) -> bool:
     )
 
 
-def _headers(creds, *, accept: str = "application/json", target: str = "") -> dict[str, str]:
-    ua = "aws-sdk-python/1.0 KiroIDE-hermes"
+# Kiro's client-version gate (raised 2026-11-09) rejects requests whose identity does not
+# look like the native IDE client, answering 403 "This version of Kiro is no longer
+# supported". A bare `KiroIDE/<version>` or `kiro-cli/<version>` still fails: the gate
+# expects the full aws-sdk-js-shaped UA pair with the IDE version and a 64-hex machine id
+# (verified by external client implementations). Version pins the floor from
+# kiro.dev/changelog/ide; bump it when the server raises the minimum.
+_KIRO_IDE_VERSION = "1.4.215"
+# ponytail: one IDE version constant for every surface; per-surface UA only differs in
+# the api/ token (streaming vs catalogue), matching what the native client sends.
+
+
+def _machine_id(creds) -> str:
+    """Stable 64-hex machine id, like the native IDE hashes a local machine identifier."""
+    seed = getattr(creds, "client_id", "") or creds.access_token or "kiro-hermes"
+    return hashlib.sha256(seed.encode()).hexdigest()
+
+
+def _user_agents(creds, *, streaming: bool) -> tuple[str, str]:
+    mid = _machine_id(creds)
+    surface = "codewhispererstreaming" if streaming else "codewhispererruntime"
+    os_token = f"os/{platform.system().lower() or 'linux'}#{platform.release()}"
+    ua = (
+        f"aws-sdk-js/1.0.0 ua/2.1 {os_token} lang/js md/nodejs#22.21.1 "
+        f"api/{surface}#1.0.0 {'m/E' if streaming else 'm/N,E'} "
+        f"KiroIDE-{_KIRO_IDE_VERSION}-{mid}"
+    )
+    return ua, f"aws-sdk-js/1.0.0 KiroIDE-{_KIRO_IDE_VERSION}-{mid}"
+
+
+def _headers(creds, *, accept: str = "application/json", target: str = "", streaming: bool = False) -> dict[str, str]:
+    ua, amz_ua = _user_agents(creds, streaming=streaming)
     headers = {
         "Accept": accept,
         "Authorization": f"Bearer {creds.access_token}",
         "TokenType": "SSO_OIDC",
         "User-Agent": ua,
-        "x-amz-user-agent": ua,
+        "x-amz-user-agent": amz_ua,
         "x-amzn-codewhisperer-optout": "true",
         "amz-sdk-invocation-id": str(uuid.uuid4()),
         "amz-sdk-request": "attempt=1; max=3",
@@ -456,6 +487,7 @@ class KiroClient:
             creds,
             accept="application/vnd.amazon.eventstream",
             target="AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+            streaming=True,
         )
         headers["x-amzn-kiro-agent-mode"] = "vibe"
         used_access_token = creds.access_token
